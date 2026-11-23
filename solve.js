@@ -14,6 +14,19 @@ export function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
+// Native markdown kernel (engine.node, C N-API): same output as
+// renderMarkdown, but zero-alloc in C. Loaded best-effort: if the binary
+// cannot load on this machine, every call falls back to the JS renderer.
+// The native side works in UTF-8, so it is only used when the body holds
+// no lone surrogates (which UTF-8 conversion would map to U+FFFD).
+import { createRequire } from 'node:module';
+let nativeMd = null;
+try {
+  const eng = createRequire(import.meta.url)('./engine.node');
+  if (eng && typeof eng.md === 'function') nativeMd = eng.md;
+} catch { nativeMd = null; }
+const LONE_SURROGATE = /[\uD800-\uDFFF]/;
+
 function longDate(date) {
   // "2026-11-09" -> "9 November 2026", from the string alone.
   return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
@@ -708,7 +721,11 @@ export function run(input) {
         return out;
       },
     };
-    const md = renderMarkdown(s.body, env);
+    let md;
+    if (nativeMd !== null && !LONE_SURROGATE.test(s.body)) {
+      try { md = nativeMd(s.body, env.link, (t) => slugify(t)); }
+      catch { md = renderMarkdown(s.body, env); }
+    } else md = renderMarkdown(s.body, env);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
