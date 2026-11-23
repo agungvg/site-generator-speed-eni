@@ -89,6 +89,11 @@ static bool is_escapable(char c) {
 typedef struct {
   napi_env env;
   napi_value linkFn, slugFn, global;
+  // C mode (runAll): callbacks implemented in C, no JS involved.
+  void *ud;
+  char *(*c_link)(void *ud, const char *s, size_t n, size_t *out_len);
+  char *(*c_slug)(void *ud, const char *s, size_t n, size_t *out_len);
+  bool use_js;
   char **ids; size_t nids, capids; // dedup of heading ids within one document
   bool failed;
 } Ctx;
@@ -107,6 +112,20 @@ static char *call_str_fn(Ctx *cx, napi_value fn, const char *s, size_t n, size_t
   out[len] = 0;
   if (out_len) *out_len = len;
   return out;
+}
+
+// Dispatch a (string)->string call to JS (md export) or to C (runAll).
+static char *resolve_link(Ctx *cx, const char *s, size_t n, size_t *out_len) {
+  if (cx->use_js) return call_str_fn(cx, cx->linkFn, s, n, out_len);
+  char *r = cx->c_link(cx->ud, s, n, out_len);
+  if (!r) cx->failed = true;
+  return r;
+}
+static char *resolve_slug(Ctx *cx, const char *s, size_t n, size_t *out_len) {
+  if (cx->use_js) return call_str_fn(cx, cx->slugFn, s, n, out_len);
+  char *r = cx->c_slug(cx->ud, s, n, out_len);
+  if (!r) cx->failed = true;
+  return r;
 }
 
 // findUnescaped(s, what, from): -1 if none.
@@ -191,7 +210,7 @@ static bool inline_md(Ctx *cx, const char *s, size_t n, Buf *out) {
       if (m != -1) { tgt = s + k + 2; tlen = (size_t)m - (size_t)k - 2; }
       if (tlen > 0 && !has_js_ws(tgt, tlen)) {
         size_t href_len = 0;
-        char *href = call_str_fn(cx, cx->linkFn, tgt, tlen, &href_len);
+        char *href = resolve_link(cx, tgt, tlen, &href_len);
         if (cx->failed) return false;
         if (!buf_puts(out, "<a href=\"")) { free(href); return false; }
         if (!buf_escape(out, href, href_len)) { free(href); return false; }
@@ -310,44 +329,42 @@ static char *unique_id(Ctx *cx, const char *slug, size_t slen, size_t *out_len) 
   }
 }
 
-typedef struct { char *html; size_t hlen; Buf toc_json; bool has_excerpt; Buf excerpt; } MdOut;
 
 // Build the result object {html, toc, excerpt} directly via N-API.
-static napi_value md_native(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3];
-  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok) return NULL;
-  if (argc < 3) { napi_throw_error(env, NULL, "md(src, linkFn, slugFn)"); return NULL; }
-  size_t srclen = 0;
-  if (napi_get_value_string_utf8(env, argv[0], NULL, 0, &srclen) != napi_ok) return NULL;
-  char *src = (char *)malloc(srclen + 1);
-  if (!src) { napi_throw_error(env, NULL, "oom"); return NULL; }
-  size_t got = 0;
-  if (napi_get_value_string_utf8(env, argv[0], src, srclen + 1, &got) != napi_ok) { free(src); return NULL; }
-  src[srclen] = 0;
+typedef struct {
+  Buf html;
+  int *toc_level; char **toc_id; size_t *toc_idlen; char **toc_html; size_t *toc_htmllen;
+  size_t ntoc, captoc;
+  Buf excerpt; bool has_excerpt;
+  size_t nblocks;
+} MdOut;
 
-  Ctx cx = { .env = env, .linkFn = argv[1], .slugFn = argv[2], .ids = NULL, .nids = 0, .capids = 0, .failed = false };
-  if (napi_get_global(env, &cx.global) != napi_ok) { free(src); napi_throw_error(env, NULL, "no global"); return NULL; }
+static void md_out_free(MdOut *out) {
+  free(out->html.p);
+  free(out->excerpt.p);
+  for (size_t t = 0; t < out->ntoc; t++) { free(out->toc_id[t]); free(out->toc_html[t]); }
+  free(out->toc_level); free(out->toc_id); free(out->toc_idlen); free(out->toc_html); free(out->toc_htmllen);
+  memset(out, 0, sizeof *out);
+}
 
+// Core markdown renderer: shared by the md export (JS callbacks) and
+// runAll (C callbacks). Fills out->html (blocks joined with '\n', NO
+// trailing newline yet), out->toc and out->excerpt.
+static bool md_render(Ctx *cx, const char *src, size_t srclen, MdOut *out) {
+  memset(out, 0, sizeof *out);
+  bool ok = true;
   // split into lines (JS split('\n'))
   size_t nlines = 1;
   for (size_t i = 0; i < srclen; i++) if (src[i] == '\n') nlines++;
   Line *lines = (Line *)malloc(nlines * sizeof *lines);
-  if (!lines) { free(src); napi_throw_error(env, NULL, "oom"); return NULL; }
+  if (!lines) return false;
   size_t li = 0, start = 0;
   for (size_t i = 0; i <= srclen; i++) {
     if (i == srclen || src[i] == '\n') { lines[li].p = src + start; lines[li].n = i - start; li++; start = i + 1; }
   }
 
-  Buf blocks = {0};       // joined blocks
-  // toc entries: parallel arrays of level, id string, html string
-  int *toc_level = NULL; char **toc_id = NULL; size_t *toc_idlen = NULL; char **toc_html = NULL; size_t *toc_htmllen = NULL;
-  size_t ntoc = 0, captoc = 0;
-  Buf excerpt = {0}; bool has_excerpt = false;
-  bool ok = true;
-  size_t nblocks = 0;
 
-#define BLOCK_SEP() do { if (nblocks > 0) { if (!buf_putc(&blocks, '\n')) { ok = false; } } nblocks++; } while (0)
+#define BLOCK_SEP() do { if (out->nblocks > 0) { if (!buf_putc(&out->html, '\n')) { ok = false; } } out->nblocks++; } while (0)
 
   size_t i = 0;
   size_t L = nlines;
@@ -364,61 +381,61 @@ static napi_value md_native(napi_env env, napi_callback_info info) {
       }
       i++;
       BLOCK_SEP();
-      if (!buf_puts(&blocks, "<pre><code")) ok = false;
+      if (!buf_puts(&out->html, "<pre><code")) ok = false;
       if (llen > 0) {
-        if (!buf_puts(&blocks, " class=\"language-")) ok = false;
-        if (!buf_escape(&blocks, lang, llen)) ok = false;
-        if (!buf_putc(&blocks, '"')) ok = false;
+        if (!buf_puts(&out->html, " class=\"language-")) ok = false;
+        if (!buf_escape(&out->html, lang, llen)) ok = false;
+        if (!buf_putc(&out->html, '"')) ok = false;
       }
-      if (!buf_putc(&blocks, '>')) ok = false;
+      if (!buf_putc(&out->html, '>')) ok = false;
       // code = escape(body) per line + '\n' == escape whole body (no specials in \n)
-      if (!buf_escape(&blocks, body.p ? body.p : "", body.len)) ok = false;
+      if (!buf_escape(&out->html, body.p ? body.p : "", body.len)) ok = false;
       free(body.p);
-      if (!buf_puts(&blocks, "</code></pre>")) ok = false;
+      if (!buf_puts(&out->html, "</code></pre>")) ok = false;
       continue;
     }
     const char *htext = NULL; size_t htlen = 0;
     int depth = heading_of(line, &htext, &htlen);
     if (depth) {
       size_t slug_len = 0;
-      char *slug = call_str_fn(&cx, cx.slugFn, htext, htlen, &slug_len);
-      if (cx.failed) { ok = false; break; }
+      char *slug = resolve_slug(cx, htext, htlen, &slug_len);
+      if (cx->failed) { ok = false; break; }
       size_t idlen = 0;
-      char *id = unique_id(&cx, slug, slug_len, &idlen);
+      char *id = unique_id(cx, slug, slug_len, &idlen);
       free(slug);
       if (!id) { ok = false; break; }
       Buf hb = {0};
-      if (!inline_md(&cx, htext, htlen, &hb)) { free(id); ok = false; break; }
+      if (!inline_md(cx, htext, htlen, &hb)) { free(id); ok = false; break; }
       BLOCK_SEP();
       char hdr[64];
       int hw = snprintf(hdr, sizeof hdr, "<h%d id=\"", depth);
-      if (!buf_putn(&blocks, hdr, (size_t)hw) || !buf_putn(&blocks, id, idlen)) { free(id); free(hb.p); ok = false; break; }
+      if (!buf_putn(&out->html, hdr, (size_t)hw) || !buf_putn(&out->html, id, idlen)) { free(id); free(hb.p); ok = false; break; }
       hw = snprintf(hdr, sizeof hdr, "\">");
-      if (!buf_putn(&blocks, hdr, (size_t)hw) || !buf_putn(&blocks, hb.p ? hb.p : "", hb.len)) { free(id); free(hb.p); ok = false; break; }
+      if (!buf_putn(&out->html, hdr, (size_t)hw) || !buf_putn(&out->html, hb.p ? hb.p : "", hb.len)) { free(id); free(hb.p); ok = false; break; }
       hw = snprintf(hdr, sizeof hdr, "</h%d>", depth);
-      if (!buf_putn(&blocks, hdr, (size_t)hw)) { free(id); free(hb.p); ok = false; break; }
+      if (!buf_putn(&out->html, hdr, (size_t)hw)) { free(id); free(hb.p); ok = false; break; }
       if (depth == 2 || depth == 3) {
-        if (ntoc == captoc) {
-          size_t nc = captoc ? captoc * 2 : 16;
-          int *nl = (int *)realloc(toc_level, nc * sizeof *nl);
-          char **ni = (char **)realloc(toc_id, nc * sizeof *ni);
-          size_t *nil = (size_t *)realloc(toc_idlen, nc * sizeof *nil);
-          char **nh = (char **)realloc(toc_html, nc * sizeof *nh);
-          size_t *nhl = (size_t *)realloc(toc_htmllen, nc * sizeof *nhl);
+        if (out->ntoc == out->captoc) {
+          size_t nc = out->captoc ? out->captoc * 2 : 16;
+          int *nl = (int *)realloc(out->toc_level, nc * sizeof *nl);
+          char **ni = (char **)realloc(out->toc_id, nc * sizeof *ni);
+          size_t *nil = (size_t *)realloc(out->toc_idlen, nc * sizeof *nil);
+          char **nh = (char **)realloc(out->toc_html, nc * sizeof *nh);
+          size_t *nhl = (size_t *)realloc(out->toc_htmllen, nc * sizeof *nhl);
           if (!nl || !ni || !nil || !nh || !nhl) { free(nl); free(ni); free(nil); free(nh); free(nhl); free(id); free(hb.p); ok = false; break; }
-          toc_level = nl; toc_id = ni; toc_idlen = nil; toc_html = nh; toc_htmllen = nhl; captoc = nc;
+          out->toc_level = nl; out->toc_id = ni; out->toc_idlen = nil; out->toc_html = nh; out->toc_htmllen = nhl; out->captoc = nc;
         }
-        toc_level[ntoc] = depth;
-        toc_id[ntoc] = id; toc_idlen[ntoc] = idlen; // ownership transferred
-        toc_html[ntoc] = hb.p; toc_htmllen[ntoc] = hb.len;
-        ntoc++;
+        out->toc_level[out->ntoc] = depth;
+        out->toc_id[out->ntoc] = id; out->toc_idlen[out->ntoc] = idlen; // ownership transferred
+        out->toc_html[out->ntoc] = hb.p; out->toc_htmllen[out->ntoc] = hb.len;
+        out->ntoc++;
         id = NULL; hb.p = NULL;
       }
       free(id); free(hb.p);
       i++;
       continue;
     }
-    if (is_hr(line)) { BLOCK_SEP(); if (!buf_puts(&blocks, "<hr>")) ok = false; i++; continue; }
+    if (is_hr(line)) { BLOCK_SEP(); if (!buf_puts(&out->html, "<hr>")) ok = false; i++; continue; }
     if (line->n > 0 && line->p[0] == '>') {
       // collect consecutive '>' lines, strip /^> ?/", trim, drop empties
       Buf joined = {0};
@@ -440,13 +457,13 @@ static napi_value md_native(napi_env env, napi_callback_info info) {
       }
       BLOCK_SEP();
       if (nkept == 0) {
-        if (!buf_puts(&blocks, "<blockquote>\n</blockquote>")) ok = false;
+        if (!buf_puts(&out->html, "<blockquote>\n</blockquote>")) ok = false;
       } else {
         Buf ob = {0};
-        if (!inline_md(&cx, joined.p, joined.len, &ob)) ok = false;
-        if (!buf_puts(&blocks, "<blockquote>\n<p>")) ok = false;
-        if (!buf_putn(&blocks, ob.p ? ob.p : "", ob.len)) ok = false;
-        if (!buf_puts(&blocks, "</p>\n</blockquote>")) ok = false;
+        if (!inline_md(cx, joined.p, joined.len, &ob)) ok = false;
+        if (!buf_puts(&out->html, "<blockquote>\n<p>")) ok = false;
+        if (!buf_putn(&out->html, ob.p ? ob.p : "", ob.len)) ok = false;
+        if (!buf_puts(&out->html, "</p>\n</blockquote>")) ok = false;
         free(ob.p);
       }
       free(joined.p);
@@ -532,21 +549,21 @@ static napi_value md_native(napi_env env, napi_callback_info info) {
         BLOCK_SEP();
         if (isOrdered && ordStart != 1) {
           char ob[64]; int w = snprintf(ob, sizeof ob, "<ol start=\"%ld\">\n", ordStart);
-          if (!buf_putn(&blocks, ob, (size_t)w)) ok = false;
+          if (!buf_putn(&out->html, ob, (size_t)w)) ok = false;
         } else if (isOrdered) {
-          if (!buf_puts(&blocks, "<ol>\n")) ok = false;
+          if (!buf_puts(&out->html, "<ol>\n")) ok = false;
         } else {
-          if (!buf_puts(&blocks, "<ul>\n")) ok = false;
+          if (!buf_puts(&out->html, "<ul>\n")) ok = false;
         }
         for (size_t it = 0; it < nitems && ok; it++) {
           Buf ob = {0};
-          if (!inline_md(&cx, items[it].b.p ? items[it].b.p : "", items[it].b.len, &ob)) { ok = false; break; }
-          if (!buf_puts(&blocks, "<li>")) ok = false;
-          if (!buf_putn(&blocks, ob.p ? ob.p : "", ob.len)) ok = false;
-          if (!buf_puts(&blocks, "</li>\n")) ok = false;
+          if (!inline_md(cx, items[it].b.p ? items[it].b.p : "", items[it].b.len, &ob)) { ok = false; break; }
+          if (!buf_puts(&out->html, "<li>")) ok = false;
+          if (!buf_putn(&out->html, ob.p ? ob.p : "", ob.len)) ok = false;
+          if (!buf_puts(&out->html, "</li>\n")) ok = false;
           free(ob.p);
         }
-        if (ok) { if (!buf_puts(&blocks, isOrdered ? "</ol>" : "</ul>")) ok = false; }
+        if (ok) { if (!buf_puts(&out->html, isOrdered ? "</ol>" : "</ul>")) ok = false; }
       }
       for (size_t q = 0; q < nitems; q++) free(items[q].b.p);
       free(items); free(cur.p);
@@ -560,7 +577,7 @@ static napi_value md_native(napi_env env, napi_callback_info info) {
         if (!buf_putn(&body, a, an)) ok = false;
       }
       i++;
-      while (i < L && ok && !ends_paragraph(&cx, &lines[i])) {
+      while (i < L && ok && !ends_paragraph(cx, &lines[i])) {
         if (!buf_putc(&body, '\n')) { ok = false; break; }
         const char *a; size_t an; trim_range(&lines[i], &a, &an);
         if (!buf_putn(&body, a, an)) { ok = false; break; }
@@ -568,15 +585,15 @@ static napi_value md_native(napi_env env, napi_callback_info info) {
       }
       if (ok) {
         Buf ob = {0};
-        if (!inline_md(&cx, body.p ? body.p : "", body.len, &ob)) ok = false;
+        if (!inline_md(cx, body.p ? body.p : "", body.len, &ob)) ok = false;
         if (ok) {
           BLOCK_SEP();
-          if (!buf_puts(&blocks, "<p>")) ok = false;
-          if (!buf_putn(&blocks, ob.p ? ob.p : "", ob.len)) ok = false;
-          if (!buf_puts(&blocks, "</p>")) ok = false;
-          if (!has_excerpt) {
-            if (!buf_putn(&excerpt, ob.p ? ob.p : "", ob.len)) ok = false;
-            has_excerpt = true;
+          if (!buf_puts(&out->html, "<p>")) ok = false;
+          if (!buf_putn(&out->html, ob.p ? ob.p : "", ob.len)) ok = false;
+          if (!buf_puts(&out->html, "</p>")) ok = false;
+          if (!out->has_excerpt) {
+            if (!buf_putn(&out->excerpt, ob.p ? ob.p : "", ob.len)) ok = false;
+            out->has_excerpt = true;
           }
         }
         free(ob.p);
@@ -585,27 +602,49 @@ static napi_value md_native(napi_env env, napi_callback_info info) {
     }
   }
 
+  free(lines);
+  return ok && !cx->failed;
+}
+
+static napi_value md_native(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok) return NULL;
+  if (argc < 3) { napi_throw_error(env, NULL, "md(src, linkFn, slugFn)"); return NULL; }
+  size_t srclen = 0;
+  if (napi_get_value_string_utf8(env, argv[0], NULL, 0, &srclen) != napi_ok) return NULL;
+  char *src = (char *)malloc(srclen + 1);
+  if (!src) { napi_throw_error(env, NULL, "oom"); return NULL; }
+  size_t got = 0;
+  if (napi_get_value_string_utf8(env, argv[0], src, srclen + 1, &got) != napi_ok) { free(src); return NULL; }
+  src[srclen] = 0;
+
+  Ctx cx = { .env = env, .linkFn = argv[1], .slugFn = argv[2], .use_js = true, .ids = NULL, .nids = 0, .capids = 0, .failed = false };
+  if (napi_get_global(env, &cx.global) != napi_ok) { free(src); napi_throw_error(env, NULL, "no global"); return NULL; }
+
+  MdOut out;
+  bool ok = md_render(&cx, src, srclen, &out);
   napi_value result = NULL;
-  if (ok && !cx.failed) {
+  if (ok) {
     napi_value obj, html_str, toc_arr, excerpt_str;
     if (napi_create_object(env, &obj) != napi_ok) ok = false;
-    // JS returns blocks.join('\n') + '\n' when non-empty; blocks hold the
-    // join, so append the trailing newline here.
-    if (ok && nblocks > 0 && !buf_putc(&blocks, '\n')) ok = false;
-    if (ok && napi_create_string_utf8(env, blocks.p ? blocks.p : "", blocks.len, &html_str) != napi_ok) ok = false;
-    if (ok && napi_create_array_with_length(env, ntoc, &toc_arr) != napi_ok) ok = false;
-    for (size_t t = 0; t < ntoc && ok; t++) {
+    // JS returns blocks.join('\n') + '\n' when non-empty; the core holds
+    // the join, so append the trailing newline here.
+    if (ok && out.nblocks > 0 && !buf_putc(&out.html, '\n')) ok = false;
+    if (ok && napi_create_string_utf8(env, out.html.p ? out.html.p : "", out.html.len, &html_str) != napi_ok) ok = false;
+    if (ok && napi_create_array_with_length(env, out.ntoc, &toc_arr) != napi_ok) ok = false;
+    for (size_t t = 0; t < out.ntoc && ok; t++) {
       napi_value e, lv, idv, hv;
       if (napi_create_object(env, &e) != napi_ok) { ok = false; break; }
-      if (napi_create_int32(env, toc_level[t], &lv) != napi_ok) { ok = false; break; }
-      if (napi_create_string_utf8(env, toc_id[t], toc_idlen[t], &idv) != napi_ok) { ok = false; break; }
-      if (napi_create_string_utf8(env, toc_html[t], toc_htmllen[t], &hv) != napi_ok) { ok = false; break; }
+      if (napi_create_int32(env, out.toc_level[t], &lv) != napi_ok) { ok = false; break; }
+      if (napi_create_string_utf8(env, out.toc_id[t], out.toc_idlen[t], &idv) != napi_ok) { ok = false; break; }
+      if (napi_create_string_utf8(env, out.toc_html[t], out.toc_htmllen[t], &hv) != napi_ok) { ok = false; break; }
       if (napi_set_named_property(env, e, "level", lv) != napi_ok) { ok = false; break; }
       if (napi_set_named_property(env, e, "id", idv) != napi_ok) { ok = false; break; }
       if (napi_set_named_property(env, e, "html", hv) != napi_ok) { ok = false; break; }
       if (napi_set_element(env, toc_arr, (uint32_t)t, e) != napi_ok) { ok = false; break; }
     }
-    if (ok && napi_create_string_utf8(env, excerpt.p ? excerpt.p : "", excerpt.len, &excerpt_str) != napi_ok) ok = false;
+    if (ok && napi_create_string_utf8(env, out.excerpt.p ? out.excerpt.p : "", out.excerpt.len, &excerpt_str) != napi_ok) ok = false;
     if (ok) {
       if (napi_set_named_property(env, obj, "html", html_str) != napi_ok) ok = false;
       if (napi_set_named_property(env, obj, "toc", toc_arr) != napi_ok) ok = false;
@@ -613,23 +652,27 @@ static napi_value md_native(napi_env env, napi_callback_info info) {
     }
     if (ok) result = obj;
   }
-  (void)toc_html;
-  free(blocks.p); free(excerpt.p); free(lines); free(src);
+  md_out_free(&out);
+  free(src);
   for (size_t k = 0; k < cx.nids; k++) free(cx.ids[k]);
   free(cx.ids);
-  for (size_t t = 0; t < ntoc; t++) { free(toc_id[t]); free(toc_html[t]); }
-  free(toc_level); free(toc_id); free(toc_idlen); free(toc_html); free(toc_htmllen);
-  if (!ok || cx.failed) {
+  if (!ok) {
     napi_throw_error(env, NULL, "engine.md failed");
     return NULL;
   }
   return result;
 }
 
+
+// ---- full native engine (JSON + frontmatter + templates + driver) ----
+#include "engine_run.c"
+
 static napi_value init(napi_env env, napi_value exports) {
   napi_value fn;
   if (napi_create_function(env, "md", NAPI_AUTO_LENGTH, md_native, NULL, &fn) != napi_ok) return NULL;
   if (napi_set_named_property(env, exports, "md", fn) != napi_ok) return NULL;
+  if (napi_create_function(env, "runAll", NAPI_AUTO_LENGTH, runall_native, NULL, &fn) != napi_ok) return NULL;
+  if (napi_set_named_property(env, exports, "runAll", fn) != napi_ok) return NULL;
   return exports;
 }
 
